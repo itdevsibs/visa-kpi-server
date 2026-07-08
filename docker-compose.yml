@@ -9,5 +9,3 @@ services:
     env_file:
       - visa-kpi-server.env
     restart: unless-stopped
-    volumes:
-      - /mnt/smb_files/web-dev:/mnt/smb_files/web-dev
