@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  web:
+    container_name: Visa-KPI-Server
+    build: .
+    ports:
+      - 5011:5011
+    env_file:
+      - visa-kpi-server.env
+    restart: unless-stopped
+    volumes:
+      - /mnt/smb_files/web-dev:/mnt/smb_files/web-dev
