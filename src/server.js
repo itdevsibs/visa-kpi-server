@@ -10,6 +10,7 @@ import { connectDatabase } from "./config/db.js";
 
 // Routes
 import userRoutes from "./routes/users.js";
+import performanceRoutes from "./routes/performance.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -100,6 +101,8 @@ io.on("connection", (socket) => {
 ===================================== */
 
 app.use("/api/users", userRoutes);
+
+app.use("/api/performance", performanceRoutes);
 
 /* =====================================
    ROOT

@@ -10,6 +10,51 @@ import {
 const router = express.Router();
 
 /* =====================================
+   HELPERS
+===================================== */
+
+function cleanText(value) {
+  return String(value ?? "").trim();
+}
+
+function buildFullName(user = {}) {
+  return [
+    cleanText(user.first_name),
+    cleanText(user.middle_name),
+    cleanText(user.last_name),
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function createUserResponse(user = {}) {
+  return {
+    id: user.id,
+    sibs_id: user.sibs_id,
+
+    first_name: user.first_name,
+    middle_name: user.middle_name,
+    last_name: user.last_name,
+    full_name: buildFullName(user),
+
+    email: user.email || "",
+
+    role: user.role,
+
+    account_id: user.account_id ?? null,
+    account_name: user.account_name || "",
+
+    department_id: user.department_id ?? null,
+    department_name: user.department_name || "",
+
+    is_active: Boolean(user.is_active),
+    last_login: user.last_login || null,
+    created_at: user.created_at || null,
+    updated_at: user.updated_at || null,
+  };
+}
+
+/* =====================================
    PASSWORD ENCRYPTION
 ===================================== */
 
@@ -24,7 +69,7 @@ function encryptPass(password) {
 
   const key = Buffer.from(
     crypto.createHash("sha256").update(secretKey).digest("hex"),
-    "utf8"
+    "utf8",
   ).slice(0, 32);
 
   const iv = Buffer.from(
@@ -33,7 +78,7 @@ function encryptPass(password) {
       .update(secretIv)
       .digest("hex")
       .substring(0, 16),
-    "utf8"
+    "utf8",
   );
 
   const cipher = crypto.createCipheriv(method, key, iv);
@@ -68,6 +113,10 @@ function authenticateToken(req, res, next) {
       });
     }
 
+    if (!process.env.JWT_SECRET) {
+      throw new Error("JWT_SECRET is not configured.");
+    }
+
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     req.user = decoded;
@@ -96,7 +145,7 @@ function authenticateToken(req, res, next) {
 
 router.post("/login", async (req, res) => {
   try {
-    const sibsId = String(req.body?.sibs_id || "").trim();
+    const sibsId = cleanText(req.body?.sibs_id);
     const password = String(req.body?.password || "");
 
     if (!sibsId || !password) {
@@ -111,17 +160,26 @@ router.post("/login", async (req, res) => {
       SELECT
         id,
         sibs_id,
-        first_name,
-        last_name,
-        role,
         password,
-        is_active
+        first_name,
+        middle_name,
+        last_name,
+        email,
+        role,
+        account_id,
+        account_name,
+        department_id,
+        department_name,
+        is_active,
+        last_login,
+        created_at,
+        updated_at
       FROM us_visa_users
       WHERE sibs_id = ?
         AND is_active = 1
       LIMIT 1
       `,
-      [sibsId]
+      [sibsId],
     );
 
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -149,12 +207,17 @@ router.post("/login", async (req, res) => {
       {
         id: user.id,
         sibs_id: user.sibs_id,
+        email: user.email || "",
         role: user.role,
+        account_id: user.account_id ?? null,
+        account_name: user.account_name || "",
+        department_id: user.department_id ?? null,
+        department_name: user.department_name || "",
       },
       process.env.JWT_SECRET,
       {
         expiresIn: process.env.JWT_EXPIRES_IN || "8h",
-      }
+      },
     );
 
     await db.query(
@@ -163,23 +226,20 @@ router.post("/login", async (req, res) => {
       SET last_login = NOW()
       WHERE id = ?
       `,
-      [user.id]
+      [user.id],
     );
+
+    const responseUser = createUserResponse({
+      ...user,
+      last_login: new Date(),
+    });
 
     return res.status(200).json({
       success: true,
       message: "Login successful.",
       token,
-      user: {
-        id: user.id,
-        sibs_id: user.sibs_id,
-        first_name: user.first_name,
-        last_name: user.last_name,
-        full_name: [user.first_name, user.last_name]
-          .filter(Boolean)
-          .join(" "),
-        role: user.role,
-      },
+      user: responseUser,
+      data: responseUser,
     });
   } catch (error) {
     console.error("[LOGIN ERROR]", error);
@@ -203,16 +263,24 @@ router.get("/me", authenticateToken, async (req, res) => {
         id,
         sibs_id,
         first_name,
+        middle_name,
         last_name,
+        email,
         role,
+        account_id,
+        account_name,
+        department_id,
+        department_name,
         is_active,
-        last_login
+        last_login,
+        created_at,
+        updated_at
       FROM us_visa_users
       WHERE id = ?
         AND is_active = 1
       LIMIT 1
       `,
-      [req.user.id]
+      [req.user.id],
     );
 
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -222,22 +290,13 @@ router.get("/me", authenticateToken, async (req, res) => {
       });
     }
 
-    const user = rows[0];
+    const responseUser = createUserResponse(rows[0]);
 
     return res.status(200).json({
       success: true,
-      data: {
-        id: user.id,
-        sibs_id: user.sibs_id,
-        first_name: user.first_name,
-        last_name: user.last_name,
-        full_name: [user.first_name, user.last_name]
-          .filter(Boolean)
-          .join(" "),
-        role: user.role,
-        is_active: Boolean(user.is_active),
-        last_login: user.last_login,
-      },
+      message: "Current user retrieved successfully.",
+      data: responseUser,
+      user: responseUser,
     });
   } catch (error) {
     console.error("[GET CURRENT USER ERROR]", error);
@@ -266,9 +325,11 @@ router.get("/kronos-employees", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("[GET KRONOS EMPLOYEES ERROR]", error);
 
+    const responseStatus = Number(error?.response?.status);
+
     const statusCode =
-      Number(error?.response?.status) >= 400
-        ? Number(error.response.status)
+      Number.isFinite(responseStatus) && responseStatus >= 400
+        ? responseStatus
         : 500;
 
     return res.status(statusCode).json({
@@ -297,7 +358,7 @@ router.get(
   authenticateToken,
   async (req, res) => {
     try {
-      const sibsId = String(req.params.sibsId || "").trim();
+      const sibsId = cleanText(req.params.sibsId);
 
       if (!sibsId) {
         return res.status(400).json({
@@ -328,9 +389,11 @@ router.get(
     } catch (error) {
       console.error("[GET KRONOS EMPLOYEE ERROR]", error);
 
+      const responseStatus = Number(error?.response?.status);
+
       const statusCode =
-        Number(error?.response?.status) >= 400
-          ? Number(error.response.status)
+        Number.isFinite(responseStatus) && responseStatus >= 400
+          ? responseStatus
           : 500;
 
       return res.status(statusCode).json({
@@ -342,7 +405,7 @@ router.get(
         data: null,
       });
     }
-  }
+  },
 );
 
 export default router;
