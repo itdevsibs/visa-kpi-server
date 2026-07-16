@@ -1,13 +1,66 @@
 import express from "express";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
+import multer from "multer";
 import db from "../config/db.js";
 import {
   getKronosDatasFromApi,
   getKronosDataByIdFromApi,
 } from "../services/kronosDatasApiService.js";
+import {
+  listEmployeeAssignments,
+  saveEmployeeAssignments,
+  syncKronosEmployeeAssignments,
+} from "../services/employeeAssignmentsService.js";
+import {
+  deleteKpiImportBatch,
+  importKpiRawFile,
+  listKpiImportHistory,
+  normalizeSourceType,
+  rebuildKpiSummaries,
+} from "../services/kpiRawImportService.js";
 
 const router = express.Router();
+
+const KPI_RAW_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
+const KPI_RAW_ALLOWED_EXTENSIONS = new Set([".xlsx", ".xls", ".csv"]);
+
+const kpiRawUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: KPI_RAW_UPLOAD_MAX_BYTES,
+    files: 1,
+  },
+  fileFilter(req, file, callback) {
+    const originalName = cleanText(file?.originalname).toLowerCase();
+    const extension = originalName.includes(".")
+      ? originalName.slice(originalName.lastIndexOf("."))
+      : "";
+
+    if (!KPI_RAW_ALLOWED_EXTENSIONS.has(extension)) {
+      return callback(
+        new Error("Only .xlsx, .xls, and .csv files are accepted."),
+      );
+    }
+
+    return callback(null, true);
+  },
+}).single("file");
+
+function handleKpiRawUpload(req, res, next) {
+  kpiRawUpload(req, res, (error) => {
+    if (!error) return next();
+
+    const isSizeError = error.code === "LIMIT_FILE_SIZE";
+
+    return res.status(400).json({
+      success: false,
+      message: isSizeError
+        ? "The uploaded file exceeds the 50 MB limit."
+        : error.message || "Unable to read the uploaded KPI file.",
+    });
+  });
+}
 
 /* =====================================
    HELPERS
@@ -137,6 +190,21 @@ function authenticateToken(req, res, next) {
       message: "Invalid authentication token.",
     });
   }
+}
+
+function requireAdministrator(req, res, next) {
+  const role = cleanText(req.user?.role)
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+
+  if (!["admin", "administrator", "super_admin", "superadmin", "super_administrator", "superadministrator"].includes(role)) {
+    return res.status(403).json({
+      success: false,
+      message: "Administrator access is required.",
+    });
+  }
+
+  return next();
 }
 
 /* =====================================
@@ -307,6 +375,300 @@ router.get("/me", authenticateToken, async (req, res) => {
     });
   }
 });
+
+/* =====================================
+   KPI EMPLOYEE ASSIGNMENTS
+===================================== */
+
+router.get(
+  "/employee-assignments",
+  authenticateToken,
+  requireAdministrator,
+  async (req, res) => {
+    try {
+      const employees = await listEmployeeAssignments(req.user);
+
+      return res.status(200).json({
+        success: true,
+        data: employees,
+        message: "Employee assignments loaded successfully.",
+      });
+    } catch (error) {
+      console.error("[GET EMPLOYEE ASSIGNMENTS ERROR]", error);
+
+      return res.status(500).json({
+        success: false,
+        data: [],
+        message:
+          error.sqlMessage ||
+          error.message ||
+          "Unable to load employee assignments.",
+      });
+    }
+  },
+);
+
+router.post(
+  "/employee-assignments/sync-kronos",
+  authenticateToken,
+  requireAdministrator,
+  async (req, res) => {
+    try {
+      const result = await syncKronosEmployeeAssignments(req.user);
+
+      return res.status(200).json({
+        success: true,
+        data: result.employees,
+        summary: result.summary,
+        message: `Kronos synchronization completed. ${result.summary.eligible} active US Visa employees are available for assignment.`,
+      });
+    } catch (error) {
+      console.error("[SYNC KRONOS EMPLOYEE ASSIGNMENTS ERROR]", error);
+
+      const responseStatus = Number(error?.response?.status);
+      const statusCode =
+        Number.isFinite(responseStatus) && responseStatus >= 400
+          ? responseStatus
+          : 500;
+
+      return res.status(statusCode).json({
+        success: false,
+        data: [],
+        message:
+          error?.response?.data?.message ||
+          error.sqlMessage ||
+          error.message ||
+          "Unable to synchronize Kronos employees.",
+      });
+    }
+  },
+);
+
+router.put(
+  "/employee-assignments",
+  authenticateToken,
+  requireAdministrator,
+  async (req, res) => {
+    try {
+      const assignments = req.body?.assignments;
+
+      if (!Array.isArray(assignments)) {
+        return res.status(400).json({
+          success: false,
+          data: [],
+          message: "The assignments field must be an array.",
+        });
+      }
+
+      const result = await saveEmployeeAssignments(assignments, req.user);
+      let rebuildResult = { productionDates: [], summaryRows: 0 };
+      let rebuildWarning = "";
+
+      if (result.updated > 0) {
+        try {
+          rebuildResult = await rebuildKpiSummaries();
+        } catch (rebuildError) {
+          console.error(
+            "[REBUILD KPI SUMMARY AFTER ASSIGNMENT SAVE ERROR]",
+            rebuildError,
+          );
+          rebuildWarning =
+            " Assignments were saved, but the KPI summary rebuild failed. Use Rebuild Reports in Administration after checking the server log.";
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        data: result.employees,
+        updated: result.updated,
+        rebuild: rebuildResult,
+        rebuildWarning: rebuildWarning || null,
+        message: `${result.updated} employee assignment${
+          result.updated === 1 ? "" : "s"
+        } saved successfully. ${Number(rebuildResult.summaryRows || 0).toLocaleString()} KPI summary row${
+          Number(rebuildResult.summaryRows || 0) === 1 ? "" : "s"
+        } regenerated using the current mappings.${rebuildWarning}`,
+      });
+    } catch (error) {
+      console.error("[SAVE EMPLOYEE ASSIGNMENTS ERROR]", error);
+
+      const isValidationError =
+        error instanceof TypeError ||
+        /not found|maximum|valid|required/i.test(error.message || "");
+
+      return res.status(isValidationError ? 400 : 500).json({
+        success: false,
+        data: [],
+        message:
+          error.sqlMessage ||
+          error.message ||
+          "Unable to save employee assignments.",
+      });
+    }
+  },
+);
+
+/* =====================================
+   KPI RAW DATA IMPORT
+===================================== */
+
+router.get(
+  "/kpi-raw-import/history",
+  authenticateToken,
+  requireAdministrator,
+  async (req, res) => {
+    try {
+      const history = await listKpiImportHistory(req.query?.limit);
+
+      return res.status(200).json({
+        success: true,
+        data: history,
+        message: "KPI import history loaded successfully.",
+      });
+    } catch (error) {
+      console.error("[GET KPI RAW IMPORT HISTORY ERROR]", error);
+
+      return res.status(500).json({
+        success: false,
+        data: [],
+        message:
+          error.sqlMessage ||
+          error.message ||
+          "Unable to load KPI import history.",
+      });
+    }
+  },
+);
+
+router.post(
+  "/kpi-raw-import/rebuild",
+  authenticateToken,
+  requireAdministrator,
+  async (req, res) => {
+    try {
+      const productionDates = Array.isArray(req.body?.productionDates)
+        ? req.body.productionDates
+        : [];
+      const result = await rebuildKpiSummaries(productionDates);
+
+      return res.status(200).json({
+        success: true,
+        data: result,
+        message: `${Number(result.summaryRows || 0).toLocaleString()} KPI summary row${
+          Number(result.summaryRows || 0) === 1 ? "" : "s"
+        } regenerated for ${result.productionDates.length.toLocaleString()} production date${
+          result.productionDates.length === 1 ? "" : "s"
+        }.`,
+      });
+    } catch (error) {
+      console.error("[REBUILD KPI SUMMARY ERROR]", error);
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error.sqlMessage ||
+          error.message ||
+          "Unable to rebuild KPI reports from the imported raw data.",
+      });
+    }
+  },
+);
+
+router.delete(
+  "/kpi-raw-import/:batchId",
+  authenticateToken,
+  requireAdministrator,
+  async (req, res) => {
+    try {
+      const result = await deleteKpiImportBatch(req.params.batchId);
+      const deletedRows = Number(result.deletedRows?.total || 0);
+
+      return res.status(200).json({
+        success: true,
+        data: result,
+        message: `${result.batch.sourceFilename || "KPI import"} was deleted. ${deletedRows.toLocaleString()} raw row${
+          deletedRows === 1 ? "" : "s"
+        } removed and ${Number(result.regeneratedSummaryRows || 0).toLocaleString()} KPI summary row${
+          Number(result.regeneratedSummaryRows || 0) === 1 ? "" : "s"
+        } regenerated from the remaining imports.`,
+      });
+    } catch (error) {
+      console.error("[DELETE KPI RAW IMPORT ERROR]", error);
+
+      const isNotFound = error.code === "KPI_IMPORT_NOT_FOUND";
+      const isValidationError =
+        error instanceof TypeError || /valid|required/i.test(error.message || "");
+
+      return res.status(isNotFound ? 404 : isValidationError ? 400 : 500).json({
+        success: false,
+        message:
+          error.sqlMessage ||
+          error.message ||
+          "Unable to delete the selected KPI import.",
+      });
+    }
+  },
+);
+
+router.post(
+  "/kpi-raw-import",
+  authenticateToken,
+  requireAdministrator,
+  handleKpiRawUpload,
+  async (req, res) => {
+    try {
+      if (!req.file?.buffer) {
+        return res.status(400).json({
+          success: false,
+          message: "Choose an Excel or CSV file to import.",
+        });
+      }
+
+      const result = await importKpiRawFile({
+        buffer: req.file.buffer,
+        fileName: req.file.originalname,
+        sourceType: normalizeSourceType(req.body?.sourceType),
+        uploadedBy: req.user?.id,
+      });
+
+      const insertedRows = result.sources.reduce(
+        (total, source) => total + Number(source.insertedRows || 0),
+        0,
+      );
+      const duplicateRows = result.sources.reduce(
+        (total, source) => total + Number(source.duplicateRows || 0),
+        0,
+      );
+
+      return res.status(201).json({
+        success: true,
+        data: result,
+        message: `${insertedRows.toLocaleString()} raw row${
+          insertedRows === 1 ? "" : "s"
+        } imported, ${duplicateRows.toLocaleString()} duplicate row${
+          duplicateRows === 1 ? "" : "s"
+        } skipped, and ${result.summaryRows.toLocaleString()} KPI summary row${
+          result.summaryRows === 1 ? "" : "s"
+        } generated.`,
+      });
+    } catch (error) {
+      console.error("[KPI RAW IMPORT ERROR]", error);
+
+      const isValidationError =
+        error instanceof TypeError ||
+        error instanceof RangeError ||
+        /supported|format|header|empty|maximum|file/i.test(error.message || "");
+
+      return res.status(isValidationError ? 400 : 500).json({
+        success: false,
+        message:
+          error.sqlMessage ||
+          error.message ||
+          "Unable to import the KPI raw-data file.",
+      });
+    }
+  },
+);
 
 /* =====================================
    GET KRONOS EMPLOYEES
