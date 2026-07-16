@@ -666,6 +666,81 @@ function filterRows(rows = [], { department = "All", account = "All" } = {}) {
   });
 }
 
+export function normalizeUpstreamPagination(
+  rawData = {},
+  query = {},
+  rowCount = 0,
+) {
+  const candidate =
+    rawData?.pagination ||
+    rawData?.meta?.pagination ||
+    rawData?.paging ||
+    rawData?.pageInfo ||
+    rawData?.meta ||
+    null;
+
+  if (!candidate || typeof candidate !== "object") {
+    return null;
+  }
+
+  const currentPage = toPositiveInteger(
+    candidate.currentPage ??
+      candidate.current_page ??
+      candidate.page ??
+      query.page,
+    1,
+  );
+
+  const limit = Math.min(
+    toPositiveInteger(
+      candidate.limit ??
+        candidate.perPage ??
+        candidate.per_page ??
+        candidate.pageSize ??
+        candidate.page_size ??
+        query.limit,
+      DEFAULT_LIMIT,
+    ),
+    MAX_LIMIT,
+  );
+
+  const total = Number(
+    candidate.total ??
+      candidate.totalRecords ??
+      candidate.total_records ??
+      candidate.count ??
+      0,
+  );
+
+  let totalPages = Number(
+    candidate.totalPages ??
+      candidate.total_pages ??
+      candidate.lastPage ??
+      candidate.last_page ??
+      0,
+  );
+
+  if ((!Number.isFinite(totalPages) || totalPages < 1) && total > 0) {
+    totalPages = Math.max(Math.ceil(total / limit), 1);
+  }
+
+  const looksPaginated =
+    currentPage > 1 ||
+    totalPages > 1 ||
+    (Number.isFinite(total) && total > Number(rowCount || 0));
+
+  if (!looksPaginated) {
+    return null;
+  }
+
+  return {
+    currentPage,
+    totalPages: Math.max(Number(totalPages) || 1, 1),
+    total: Number.isFinite(total) && total >= 0 ? total : rowCount,
+    limit,
+  };
+}
+
 function paginateRows(rows = [], query = {}) {
   const page = toPositiveInteger(query.page, 1);
   const requestedLimit = toPositiveInteger(query.limit, DEFAULT_LIMIT);
@@ -805,7 +880,18 @@ export async function getKronosDatasFromApi(query = {}, user = null) {
       })
     : searchedRows;
 
-  const paginated = paginateRows(filteredRows, query);
+  const upstreamPagination = normalizeUpstreamPagination(
+    rawData,
+    query,
+    found.rows.length,
+  );
+
+  const paginated = upstreamPagination
+    ? {
+        data: filteredRows,
+        pagination: upstreamPagination,
+      }
+    : paginateRows(filteredRows, query);
 
   const includeDepartments = String(query.includeDepartments || "") === "1";
   const includeAccounts = String(query.includeAccounts || "") === "1";
