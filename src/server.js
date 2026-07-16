@@ -10,9 +10,7 @@ import { connectDatabase } from "./config/db.js";
 
 // Routes
 import userRoutes from "./routes/users.js";
-import usVisaKpiRoutes from "./routes/usVisaKpi.js";
-
-dotenv.config();
+import performanceRoutes from "./routes/performance.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -103,7 +101,8 @@ io.on("connection", (socket) => {
 ===================================== */
 
 app.use("/api/users", userRoutes);
-app.use("/api/us-visa-kpi", usVisaKpiRoutes);
+
+app.use("/api/performance", performanceRoutes);
 
 /* =====================================
    ROOT
